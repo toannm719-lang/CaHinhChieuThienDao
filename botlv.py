@@ -1,92 +1,128 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import aiosqlite
+import sqlite3
 import random
-import os
 import asyncio
+import os
 from easy_pil import Editor, Font, load_image_async
+from io import BytesIO
 
 TOKEN = os.getenv("TOKEN")
 
+# ID kênh thông báo level
 LEVEL_UP_CHANNEL_ID = 1478478635491918027
 
 intents = discord.Intents.all()
-intents.message_content = True
-intents.members = True
 
 bot = commands.Bot(
     command_prefix="f",
     intents=intents
 )
 
-cooldown = {}
+tree = bot.tree
 
 # ================= DATABASE =================
 
-async def setup_db():
+db = sqlite3.connect("levels.db")
+cursor = db.cursor()
 
-    async with aiosqlite.connect("levels.db") as db:
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS levels (
+    guild_id INTEGER,
+    user_id INTEGER,
+    text_xp INTEGER DEFAULT 0,
+    text_level INTEGER DEFAULT 0,
+    voice_xp INTEGER DEFAULT 0,
+    voice_level INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS levels(
-            guild_id INTEGER,
-            user_id INTEGER,
-            text_xp INTEGER DEFAULT 0,
-            text_level INTEGER DEFAULT 0,
-            voice_xp INTEGER DEFAULT 0,
-            voice_level INTEGER DEFAULT 0,
-            PRIMARY KEY(guild_id, user_id)
-        )
-        """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS level_roles (
+    guild_id INTEGER,
+    level INTEGER,
+    role_id INTEGER,
+    PRIMARY KEY (guild_id, level)
+)
+""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS level_roles(
-            guild_id INTEGER,
-            level INTEGER,
-            role_id INTEGER
-        )
-        """)
+db.commit()
 
-        await db.commit()
+# ================= SYSTEM =================
 
-# ================= XP =================
+cooldown = {}
 
 def xp_needed(level):
-    return 100 * (level ** 2) + 100
+    return 5 * (level ** 2) + 50 * level + 100
 
-def calc_level(xp):
+def get_data(guild_id, user_id):
 
-    level = 0
+    cursor.execute(
+        "SELECT * FROM levels WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    )
 
-    while xp >= xp_needed(level):
+    data = cursor.fetchone()
 
-        xp -= xp_needed(level)
-        level += 1
+    if data is None:
 
-    return level
+        cursor.execute(
+            "INSERT INTO levels VALUES (?, ?, 0, 0, 0, 0)",
+            (guild_id, user_id)
+        )
 
-# ================= READY =================
+        db.commit()
 
-@bot.event
-async def on_ready():
+        return (guild_id, user_id, 0, 0, 0, 0)
 
-    await setup_db()
+    return data
 
-    voice_xp_task.start()
+# ================= LEVEL ROLE =================
 
-    try:
+async def check_level_role(member, level):
 
-        synced = await bot.tree.sync()
+    cursor.execute(
+        "SELECT role_id FROM level_roles WHERE guild_id=? AND level=?",
+        (member.guild.id, level)
+    )
 
-        print(f"Synced {len(synced)} slash commands")
+    data = cursor.fetchone()
 
-    except Exception as e:
-        print(e)
+    if data:
 
-    print(f"Logged in as {bot.user}")
+        role = member.guild.get_role(data[0])
 
-# ================= TEXT XP =================
+        if role:
+
+            try:
+                await member.add_roles(role)
+            except:
+                pass
+
+# ================= LEVEL UP MESSAGE =================
+
+async def send_level_message(member, level, level_type="text"):
+
+    channel = bot.get_channel(LEVEL_UP_CHANNEL_ID)
+
+    if channel is None:
+        return
+
+    if level_type == "text":
+
+        await channel.send(
+            f"🎉 {member.mention} đã lên text level {level}!"
+        )
+
+    else:
+
+        await channel.send(
+            f"🎧 {member.mention} đã lên voice level {level}!"
+        )
+
+# ================= TEXT LEVEL =================
 
 @bot.event
 async def on_message(message):
@@ -97,91 +133,67 @@ async def on_message(message):
     if not message.guild:
         return
 
-    user_id = message.author.id
-    guild_id = message.guild.id
+    key = f"{message.guild.id}-{message.author.id}"
 
-    # cooldown chống spam
-    if user_id in cooldown:
+    if key in cooldown:
+        return
 
-        if cooldown[user_id] > asyncio.get_event_loop().time():
+    cooldown[key] = True
 
-            await bot.process_commands(message)
-            return
+    async def remove_cooldown():
+        await asyncio.sleep(10)
+        cooldown.pop(key, None)
 
-    cooldown[user_id] = asyncio.get_event_loop().time() + 10
+    asyncio.create_task(remove_cooldown())
 
-    xp_gain = random.randint(15, 25)
+    data = get_data(
+        message.guild.id,
+        message.author.id
+    )
 
-    async with aiosqlite.connect("levels.db") as db:
+    xp = data[2]
+    level = data[3]
 
-        await db.execute("""
-        INSERT OR IGNORE INTO levels
-        (guild_id, user_id, text_xp, text_level, voice_xp, voice_level)
-        VALUES (?, ?, 0, 0, 0, 0)
-        """, (guild_id, user_id))
+    gain = random.randint(10, 20)
 
-        cursor = await db.execute("""
-        SELECT text_xp, text_level
-        FROM levels
-        WHERE guild_id = ? AND user_id = ?
-        """, (guild_id, user_id))
+    xp += gain
 
-        data = await cursor.fetchone()
+    need = xp_needed(level)
 
-        old_xp = data[0]
-        old_level = data[1]
+    if xp >= need:
 
-        new_xp = old_xp + xp_gain
-        new_level = calc_level(new_xp)
+        level += 1
 
-        await db.execute("""
-        UPDATE levels
-        SET text_xp = ?, text_level = ?
-        WHERE guild_id = ? AND user_id = ?
-        """, (new_xp, new_level, guild_id, user_id))
+        await send_level_message(
+            message.author,
+            level,
+            "text"
+        )
 
-        await db.commit()
+        await check_level_role(
+            message.author,
+            level
+        )
 
-    # level up
-    if new_level > old_level:
+    cursor.execute("""
+    UPDATE levels
+    SET text_xp=?, text_level=?
+    WHERE guild_id=? AND user_id=?
+    """, (
+        xp,
+        level,
+        message.guild.id,
+        message.author.id
+    ))
 
-        channel = bot.get_channel(LEVEL_UP_CHANNEL_ID)
-
-        if channel:
-
-            await channel.send(
-                f"🎉 {message.author.mention} đã lên text level **{new_level}**!"
-            )
-
-        # role reward
-        async with aiosqlite.connect("levels.db") as db:
-
-            cursor = await db.execute("""
-            SELECT role_id
-            FROM level_roles
-            WHERE guild_id = ? AND level = ?
-            """, (guild_id, new_level))
-
-            role_data = await cursor.fetchone()
-
-            if role_data:
-
-                role = message.guild.get_role(role_data[0])
-
-                if role:
-
-                    try:
-                        await message.author.add_roles(role)
-
-                    except:
-                        pass
+    db.commit()
 
     await bot.process_commands(message)
 
-# ================= VOICE XP =================
+# ================= VOICE LEVEL =================
 
 @tasks.loop(minutes=1)
-async def voice_xp_task():
+async def voice_task():
 
     for guild in bot.guilds:
 
@@ -192,220 +204,232 @@ async def voice_xp_task():
                 if member.bot:
                     continue
 
-                async with aiosqlite.connect("levels.db") as db:
+                data = get_data(
+                    guild.id,
+                    member.id
+                )
 
-                    await db.execute("""
-                    INSERT OR IGNORE INTO levels
-                    (guild_id, user_id, text_xp, text_level, voice_xp, voice_level)
-                    VALUES (?, ?, 0, 0, 0, 0)
-                    """, (guild.id, member.id))
+                xp = data[4]
+                level = data[5]
 
-                    cursor = await db.execute("""
-                    SELECT voice_xp, voice_level
-                    FROM levels
-                    WHERE guild_id = ? AND user_id = ?
-                    """, (guild.id, member.id))
+                xp += 15
 
-                    data = await cursor.fetchone()
+                need = xp_needed(level)
 
-                    old_xp = data[0]
-                    old_level = data[1]
+                if xp >= need:
 
-                    gain = random.randint(10, 18)
+                    level += 1
 
-                    new_xp = old_xp + gain
-                    new_level = calc_level(new_xp)
+                    await send_level_message(
+                        member,
+                        level,
+                        "voice"
+                    )
 
-                    await db.execute("""
-                    UPDATE levels
-                    SET voice_xp = ?, voice_level = ?
-                    WHERE guild_id = ? AND user_id = ?
-                    """, (new_xp, new_level, guild.id, member.id))
+                    await check_level_role(
+                        member,
+                        level
+                    )
 
-                    await db.commit()
+                cursor.execute("""
+                UPDATE levels
+                SET voice_xp=?, voice_level=?
+                WHERE guild_id=? AND user_id=?
+                """, (
+                    xp,
+                    level,
+                    guild.id,
+                    member.id
+                ))
 
-                if new_level > old_level:
+    db.commit()
 
-                    channel = bot.get_channel(LEVEL_UP_CHANNEL_ID)
+# ================= RANK =================
 
-                    if channel:
-
-                        await channel.send(
-                            f"🎤 {member.mention} đã lên voice level **{new_level}**!"
-                        )
-
-# ================= RANK CARD =================
-
-async def create_rank_card(member, data):
-
-    text_level = data[1]
-    voice_level = data[3]
-
-    background = Editor(
-        "https://i.imgur.com/4M34hi2.png"
-    )
-
-    profile = await load_image_async(
-        str(member.display_avatar.url)
-    )
-
-    profile = Editor(profile).resize((150, 150)).circle_image()
-
-    background.paste(profile, (40, 40))
-
-    font = Font.poppins(size=40)
-    small_font = Font.poppins(size=28)
-
-    background.text(
-        (220, 50),
-        member.name,
-        color="white",
-        font=font
-    )
-
-    background.text(
-        (220, 120),
-        f"Text Level: {text_level}",
-        color="white",
-        font=small_font
-    )
-
-    background.text(
-        (220, 170),
-        f"Voice Level: {voice_level}",
-        color="white",
-        font=small_font
-    )
-
-    file = discord.File(
-        fp=background.image_bytes,
-        filename="rank.png"
-    )
-
-    return file
-
-# ================= PREFIX RANK =================
-
-@bot.command()
-async def rank(ctx, member: discord.Member = None):
-
-    if not member:
-        member = ctx.author
-
-    async with aiosqlite.connect("levels.db") as db:
-
-        cursor = await db.execute("""
-        SELECT text_xp, text_level, voice_xp, voice_level
-        FROM levels
-        WHERE guild_id = ? AND user_id = ?
-        """, (ctx.guild.id, member.id))
-
-        data = await cursor.fetchone()
-
-    if not data:
-        return await ctx.send("Chưa có dữ liệu.")
-
-    file = await create_rank_card(member, data)
-
-    await ctx.send(file=file)
-
-# ================= SLASH RANK =================
-
-@bot.tree.command(
+@tree.command(
     name="rank",
     description="Xem rank"
 )
-async def slash_rank(
+async def rank(
     interaction: discord.Interaction,
     member: discord.Member = None
 ):
 
-    if not member:
+    await interaction.response.defer()
+
+    if member is None:
         member = interaction.user
 
-    async with aiosqlite.connect("levels.db") as db:
+    data = get_data(
+        interaction.guild.id,
+        member.id
+    )
 
-        cursor = await db.execute("""
-        SELECT text_xp, text_level, voice_xp, voice_level
-        FROM levels
-        WHERE guild_id = ? AND user_id = ?
-        """, (interaction.guild.id, member.id))
+    xp = data[2]
+    level = data[3]
 
-        data = await cursor.fetchone()
+    need = xp_needed(level)
 
-    if not data:
-        return await interaction.response.send_message(
-            "Chưa có dữ liệu."
+    percentage = int((xp / need) * 100)
+
+    # NỀN KHÔNG CẦN ẢNH
+    background = Editor(
+        (800, 300),
+        color="#2B2D31"
+    )
+
+    # AVATAR
+    profile = await load_image_async(
+        str(member.display_avatar.url)
+    )
+
+    profile = Editor(profile).resize(
+        (150, 150)
+    ).circle_image()
+
+    background.paste(profile, (50, 75))
+
+    # THANH XP
+    background.rectangle(
+        (250, 180),
+        width=500,
+        height=40,
+        fill="#23272A",
+        radius=20
+    )
+
+    background.bar(
+        (250, 180),
+        max_width=500,
+        height=40,
+        percentage=percentage,
+        fill="#5865F2",
+        radius=20
+    )
+
+    poppins = Font.poppins(size=40)
+
+    # TEXT
+    background.text(
+        (250, 70),
+        member.name,
+        font=poppins,
+        color="white"
+    )
+
+    background.text(
+        (250, 120),
+        f"Level: {level}",
+        font=poppins,
+        color="white"
+    )
+
+    background.text(
+        (550, 120),
+        f"{xp}/{need} XP",
+        font=poppins,
+        color="white"
+    )
+
+    file = discord.File(
+        fp=BytesIO(background.image_bytes),
+        filename="rank.png"
+    )
+
+    await interaction.followup.send(
+        file=file
+    )
+
+# ================= LEADERBOARD =================
+
+@tree.command(
+    name="leaderboard",
+    description="BXH level"
+)
+async def leaderboard(interaction: discord.Interaction):
+
+    cursor.execute("""
+    SELECT user_id, text_level, text_xp
+    FROM levels
+    WHERE guild_id=?
+    ORDER BY text_level DESC, text_xp DESC
+    LIMIT 10
+    """, (interaction.guild.id,))
+
+    data = cursor.fetchall()
+
+    embed = discord.Embed(
+        title="🏆 Leaderboard",
+        color=discord.Color.blurple()
+    )
+
+    for i, user_data in enumerate(data, start=1):
+
+        member = interaction.guild.get_member(
+            user_data[0]
         )
-
-    file = await create_rank_card(member, data)
-
-    await interaction.response.send_message(file=file)
-
-# ================= TOP =================
-
-@bot.command()
-async def top(ctx):
-
-    async with aiosqlite.connect("levels.db") as db:
-
-        cursor = await db.execute("""
-        SELECT user_id, text_level, voice_level
-        FROM levels
-        WHERE guild_id = ?
-        ORDER BY text_level DESC
-        LIMIT 10
-        """, (ctx.guild.id,))
-
-        data = await cursor.fetchall()
-
-    msg = "🏆 Leaderboard\n\n"
-
-    for i, row in enumerate(data, start=1):
-
-        member = ctx.guild.get_member(row[0])
 
         if member:
 
-            msg += (
-                f"{i}. {member.name} | "
-                f"Text Lv: {row[1]} | "
-                f"Voice Lv: {row[2]}\n"
+            embed.add_field(
+                name=f"#{i} - {member}",
+                value=f"Level: {user_data[1]} | XP: {user_data[2]}",
+                inline=False
             )
 
-    await ctx.send(msg)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
-# ================= SETROLE =================
+# ================= SET ROLE =================
 
-@bot.command()
-@commands.has_permissions(administrator=True)
+@tree.command(
+    name="setrole",
+    description="Set role level"
+)
+@app_commands.describe(
+    level="Level cần nhận role",
+    role="Role nhận"
+)
 async def setrole(
-    ctx,
+    interaction: discord.Interaction,
     level: int,
     role: discord.Role
 ):
 
-    async with aiosqlite.connect("levels.db") as db:
+    if not interaction.user.guild_permissions.administrator:
 
-        await db.execute("""
-        INSERT INTO level_roles(
-            guild_id,
-            level,
-            role_id
+        return await interaction.response.send_message(
+            "❌ Bạn không có quyền.",
+            ephemeral=True
         )
-        VALUES (?, ?, ?)
-        """, (
-            ctx.guild.id,
-            level,
-            role.id
-        ))
 
-        await db.commit()
+    cursor.execute("""
+    INSERT OR REPLACE INTO level_roles
+    VALUES (?, ?, ?)
+    """, (
+        interaction.guild.id,
+        level,
+        role.id
+    ))
 
-    await ctx.send(
-        f"Đã set {role.mention} cho level {level}"
+    db.commit()
+
+    await interaction.response.send_message(
+        f"✅ Level {level} sẽ nhận {role.mention}"
     )
 
-# ================= RUN =================
+# ================= READY =================
+
+@bot.event
+async def on_ready():
+
+    await tree.sync()
+
+    voice_task.start()
+
+    print(f"Logged in as {bot.user}")
+
+# ================= START =================
 
 bot.run(TOKEN)
